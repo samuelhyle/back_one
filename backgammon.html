@@ -1,0 +1,992 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Backgammon (Single-File)</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: #0f1115; color: #e7e7e7; display: grid; place-items: center;
+    }
+    .wrap { width: min(1100px, 98vw); padding: 14px; }
+    .top {
+      display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .panel {
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+      background: #171a21; border: 1px solid #2a2f3a; border-radius: 12px; padding: 10px 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.25);
+    }
+    button {
+      background: #2a2f3a; color: #e7e7e7; border: 1px solid #3a4150;
+      padding: 8px 12px; border-radius: 10px; cursor: pointer;
+      transition: transform .05s ease, background .2s ease;
+      font-weight: 600;
+    }
+    button:hover { background: #343b4b; }
+    button:active { transform: translateY(1px); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .pill {
+      padding: 6px 10px; border-radius: 999px; border: 1px solid #3a4150;
+      background: #11141a; font-size: 13px;
+    }
+    .dice {
+      display: inline-flex; gap: 8px; align-items: center;
+    }
+    .die {
+      width: 34px; height: 34px; border-radius: 10px; border: 1px solid #3a4150;
+      display: grid; place-items: center; font-weight: 800; background: #0f1115;
+    }
+    .die.used { opacity: .35; text-decoration: line-through; }
+    canvas {
+      width: 100%; height: auto;
+      background: linear-gradient(180deg, #1a120e, #140e0b);
+      border-radius: 16px;
+      border: 1px solid #2a2f3a;
+      box-shadow: 0 20px 60px rgba(0,0,0,.35);
+      user-select: none;
+      touch-action: none;
+    }
+    .hint { font-size: 13px; opacity: .9; line-height: 1.35; }
+    .hint b { color: #ffffff; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="panel">
+      <span class="pill" id="turnPill">Turn: White</span>
+      <span class="pill" id="statusPill">Click <b>Roll</b> to start.</span>
+      <span class="pill" id="barPill">Bar W: 0 · B: 0</span>
+      <span class="pill" id="offPill">Off W: 0 · B: 0</span>
+    </div>
+
+    <div class="panel">
+      <div class="dice" id="diceBox"></div>
+      <button id="rollBtn">Roll</button>
+      <button id="undoBtn" disabled>Undo</button>
+      <button id="endBtn" disabled>End turn</button>
+    </div>
+  </div>
+
+  <canvas id="board" width="1100" height="650"></canvas>
+
+  <div class="top" style="margin-top:10px;">
+    <div class="panel hint" style="flex:1;">
+      <div>
+        <b>How to play:</b> Roll → click a checker (or the bar) → click a highlighted destination.  
+        You must enter from the <b>bar</b> first. Hitting sends a single opponent checker to the bar.  
+        Bearing off is allowed when all your checkers are in your home board.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ---------- Utilities ----------
+  const deepCopy = (x) => JSON.parse(JSON.stringify(x));
+  const uniqKey = (m) => `${m.from}:${m.to}:${m.die}`;
+
+  function randDie() { return 1 + Math.floor(Math.random() * 6); }
+
+  // ---------- Game State ----------
+  const WHITE = "W";
+  const BLACK = "B";
+
+  function initialState() {
+    // points: 0..23 represent points 1..24 (point 1 = white home / near white bear-off).
+    // White moves decreasing index; Black moves increasing index.
+    const points = Array.from({length: 24}, () => ({ owner: null, count: 0 }));
+
+    // Standard backgammon setup (from White perspective):
+    // White: 2 on 24, 5 on 13, 3 on 8, 5 on 6
+    // Black: 2 on 1, 5 on 12, 3 on 17, 5 on 19
+    place(points, 23, WHITE, 2); // point 24
+    place(points, 12, WHITE, 5); // point 13 (index 12)
+    place(points, 7,  WHITE, 3); // point 8  (index 7)
+    place(points, 5,  WHITE, 5); // point 6  (index 5)
+
+    place(points, 0,  BLACK, 2); // point 1
+    place(points, 11, BLACK, 5); // point 12 (index 11)
+    place(points, 16, BLACK, 3); // point 17 (index 16)
+    place(points, 18, BLACK, 5); // point 19 (index 18)
+
+    return {
+      points,
+      bar: { W: 0, B: 0 },
+      off: { W: 0, B: 0 },
+      turn: WHITE,
+      dice: [],          // expanded dice (e.g., [3,5] or [4,4,4,4])
+      rolled: false,
+    };
+  }
+
+  function place(points, idx, owner, count) {
+    points[idx].owner = owner;
+    points[idx].count = count;
+  }
+
+  function opponent(p) { return p === WHITE ? BLACK : WHITE; }
+
+  function homeRange(p) {
+    // indices in home board
+    return p === WHITE ? [0,5] : [18,23];
+  }
+
+  function allInHome(state, p) {
+    if (state.bar[p] > 0) return false;
+    const [a,b] = homeRange(p);
+    for (let i=0;i<24;i++) {
+      const pt = state.points[i];
+      if (pt.owner === p && (i < a || i > b)) return false;
+    }
+    return true;
+  }
+
+  // ---------- Move generation ----------
+  // Move representation:
+  // { from: number|"bar", to: number|"off", die: number, hit: boolean }
+
+  function isBlocked(state, p, idx) {
+    const pt = state.points[idx];
+    if (pt.count === 0) return false;
+    if (pt.owner === p) return false;
+    // opponent occupies
+    return pt.count >= 2;
+  }
+
+  function canHit(state, p, idx) {
+    const pt = state.points[idx];
+    return pt.count === 1 && pt.owner === opponent(p);
+  }
+
+  function entryIndex(p, die) {
+    // Bar entry: White enters on points 24..19 => indices 23..18 using die 1..6
+    // Black enters on points 1..6 => indices 0..5 using die 1..6
+    return p === WHITE ? (24 - die) : (die - 1);
+  }
+
+  function bearOffAllowedFrom(state, p, fromIdx, die) {
+    if (!allInHome(state, p)) return false;
+
+    if (p === WHITE) {
+      // distance from point index i to off = i+1
+      const dist = fromIdx + 1;
+      if (die === dist) return true;
+      if (die > dist) {
+        // overshoot allowed only if no checkers on higher points (farther from off) in home board
+        for (let i = fromIdx + 1; i <= 5; i++) {
+          if (state.points[i].owner === WHITE && state.points[i].count > 0) return false;
+        }
+        return true;
+      }
+      return false;
+    } else {
+      // Black distance to off from index i is (24 - i)
+      const dist = 24 - fromIdx;
+      if (die === dist) return true;
+      if (die > dist) {
+        // overshoot allowed only if no checkers on lower points (farther from off) in home board
+        for (let i = fromIdx - 1; i >= 18; i--) {
+          if (state.points[i].owner === BLACK && state.points[i].count > 0) return false;
+        }
+        return true;
+      }
+      return false;
+    }
+  }
+
+  function legalMovesForDie(state, p, die) {
+    const moves = [];
+
+    // Must enter from bar if any on bar
+    if (state.bar[p] > 0) {
+      const to = entryIndex(p, die);
+      if (to < 0 || to > 23) return moves;
+      if (isBlocked(state, p, to)) return moves;
+      moves.push({ from: "bar", to, die, hit: canHit(state, p, to) });
+      return moves;
+    }
+
+    for (let i=0;i<24;i++) {
+      const pt = state.points[i];
+      if (pt.owner !== p || pt.count <= 0) continue;
+
+      if (p === WHITE) {
+        const to = i - die;
+        if (to >= 0) {
+          if (!isBlocked(state, p, to)) {
+            moves.push({ from: i, to, die, hit: canHit(state, p, to) });
+          }
+        } else {
+          if (bearOffAllowedFrom(state, p, i, die)) {
+            moves.push({ from: i, to: "off", die, hit: false });
+          }
+        }
+      } else {
+        const to = i + die;
+        if (to <= 23) {
+          if (!isBlocked(state, p, to)) {
+            moves.push({ from: i, to, die, hit: canHit(state, p, to) });
+          }
+        } else {
+          if (bearOffAllowedFrom(state, p, i, die)) {
+            moves.push({ from: i, to: "off", die, hit: false });
+          }
+        }
+      }
+    }
+
+    return moves;
+  }
+
+  function applyMove(state, p, move) {
+    // remove from source
+    if (move.from === "bar") {
+      state.bar[p]--;
+    } else {
+      const src = state.points[move.from];
+      src.count--;
+      if (src.count === 0) src.owner = null;
+    }
+
+    // handle destination
+    if (move.to === "off") {
+      state.off[p]++;
+      return;
+    }
+
+    const dst = state.points[move.to];
+    if (move.hit) {
+      // remove opponent single checker to bar
+      const opp = opponent(p);
+      dst.count = 0;
+      dst.owner = null;
+      state.bar[opp]++;
+    }
+
+    if (dst.count === 0) {
+      dst.owner = p;
+      dst.count = 1;
+    } else {
+      dst.owner = p;
+      dst.count++;
+    }
+  }
+
+  function diceOrders(dice) {
+    // dice is expanded list already for doubles, but for non-doubles we consider both orders.
+    // For standard (2 dice), dice.length is 2 and dice[0] != dice[1] => return [ [a,b], [b,a] ]
+    if (dice.length === 2 && dice[0] !== dice[1]) {
+      return [[dice[0], dice[1]], [dice[1], dice[0]]];
+    }
+    return [dice.slice()];
+  }
+
+  function generateLegalSequences(state, p, diceExpanded) {
+    const orders = diceOrders(diceExpanded);
+    const sequences = [];
+
+    for (const order of orders) {
+      const dfs = (st, idx, seq) => {
+        if (idx >= order.length) {
+          sequences.push(seq.slice());
+          return;
+        }
+        const die = order[idx];
+        const moves = legalMovesForDie(st, p, die);
+
+        if (moves.length === 0) {
+          // can't play this die (for this order), stop here
+          sequences.push(seq.slice());
+          return;
+        }
+
+        for (const m of moves) {
+          const st2 = deepCopy(st);
+          applyMove(st2, p, m);
+          seq.push(m);
+          dfs(st2, idx+1, seq);
+          seq.pop();
+        }
+      };
+      dfs(deepCopy(state), 0, []);
+    }
+
+    // Filter by rules:
+    // 1) Must use maximum number of dice if possible.
+    let maxLen = 0;
+    for (const s of sequences) maxLen = Math.max(maxLen, s.length);
+    let best = sequences.filter(s => s.length === maxLen);
+
+    // 2) If only one die can be played (maxLen===1 for 2 dice), must play the higher die.
+    if (diceExpanded.length === 2 && maxLen === 1 && diceExpanded[0] !== diceExpanded[1]) {
+      const high = Math.max(diceExpanded[0], diceExpanded[1]);
+      best = best.filter(s => s[0] && s[0].die === high);
+    }
+
+    // Remove duplicates (can happen via different orders yielding same sequence)
+    const seen = new Set();
+    const unique = [];
+    for (const s of best) {
+      const key = s.map(m => `${m.from}-${m.to}-${m.die}`).join("|");
+      if (!seen.has(key)) { seen.add(key); unique.push(s); }
+    }
+    return unique;
+  }
+
+  // ---------- UI / Drawing ----------
+  const canvas = document.getElementById("board");
+  const ctx = canvas.getContext("2d");
+
+  const rollBtn = document.getElementById("rollBtn");
+  const undoBtn = document.getElementById("undoBtn");
+  const endBtn  = document.getElementById("endBtn");
+
+  const turnPill = document.getElementById("turnPill");
+  const statusPill = document.getElementById("statusPill");
+  const barPill = document.getElementById("barPill");
+  const offPill = document.getElementById("offPill");
+  const diceBox = document.getElementById("diceBox");
+
+  let state = initialState();
+
+  // Turn interaction state
+  let allSequences = [];      // all max-legal sequences at turn start
+  let chosenMoves = [];       // moves made so far
+  let history = [];           // snapshots for undo
+  let selectedFrom = null;    // number|"bar"|null
+  let allowedNextMoves = [];  // list of moves for next step consistent with sequences
+
+  function setStatus(html) {
+    statusPill.innerHTML = html;
+  }
+
+  function updatePills() {
+    turnPill.textContent = `Turn: ${state.turn === WHITE ? "White" : "Black"}`;
+    barPill.textContent = `Bar W: ${state.bar.W} · B: ${state.bar.B}`;
+    offPill.textContent = `Off W: ${state.off.W} · B: ${state.off.B}`;
+  }
+
+  function renderDice() {
+    diceBox.innerHTML = "";
+    if (!state.rolled) return;
+    const usedCount = chosenMoves.length;
+    state.dice.forEach((d, idx) => {
+      const el = document.createElement("div");
+      el.className = "die" + (idx < usedCount ? " used" : "");
+      el.textContent = d;
+      diceBox.appendChild(el);
+    });
+  }
+
+  function computeAllowedNextMoves() {
+    if (!state.rolled) return [];
+    const k = chosenMoves.length;
+    const opts = new Map(); // key -> move
+    for (const seq of allSequences) {
+      if (seq.length > k) {
+        const m = seq[k];
+        opts.set(uniqKey(m), m);
+      }
+    }
+    return Array.from(opts.values());
+  }
+
+  function filterSequencesByPrefix() {
+    const k = chosenMoves.length;
+    allSequences = allSequences.filter(seq => {
+      if (seq.length < k) return false;
+      for (let i=0;i<k;i++) {
+        const a = chosenMoves[i], b = seq[i];
+        if (a.from !== b.from || a.to !== b.to || a.die !== b.die) return false;
+      }
+      return true;
+    });
+  }
+
+  function checkWin() {
+    if (state.off.W >= 15) return WHITE;
+    if (state.off.B >= 15) return BLACK;
+    return null;
+  }
+
+  // Board geometry
+  const GEO = {
+    pad: 20,
+    barW: 90,
+    offW: 90,
+    pointW: 70,
+    pointH: 260,
+    midGap: 10,
+    checkerR: 22,
+  };
+
+  function pointX(idx) {
+    // left half: 12 points (6 top + 6 bottom) on each side of bar
+    // Layout columns: 0..5 (right of bar), 6..11 (far right), bar, 12..17 (far left), 18..23 (left of bar)
+    // We draw from left to right as:
+    // [points 23..18] [bar] [points 17..12] (top row)
+    // [points 0..5]   [bar] [points 6..11]  (bottom row)
+    // So x mapping depends on whether idx on left side (18..23 or 0..5) vs right side (12..17 or 6..11)
+    const { pad, pointW, barW } = GEO;
+    const leftStart = pad;
+    const barStart = pad + 6*pointW;
+    const rightStart = barStart + barW;
+
+    // Columns 0..5 are right side (closest to bar on bottom), indices 0..5.
+    // Columns 18..23 are left side (closest to bar on top), indices 18..23.
+    // We map by visual column:
+    // Visual columns left block (6 cols): indices [23,22,21,20,19,18] (top) and [0,1,2,3,4,5] (bottom)
+    // Visual columns right block (6 cols): indices [17,16,15,14,13,12] (top) and [6,7,8,9,10,11] (bottom)
+    let col;
+    if (idx >= 18) col = 23 - idx;                 // 23->0 ... 18->5
+    else if (idx <= 5) col = idx;                  // 0->0 ... 5->5
+    else if (idx >= 12 && idx <= 17) col = 5 + (17 - idx); // 17->5 ... 12->10 (but right block has 6 cols; use 0..5)
+    else col = 5 + (idx - 6);                      // 6->5 ... 11->10
+
+    // Decide block:
+    const inLeftBlock = (idx >= 18) || (idx <= 5);
+    if (inLeftBlock) {
+      return leftStart + col*pointW + pointW/2;
+    } else {
+      // convert col to 0..5 for right block
+      const c = col - 5;
+      return rightStart + c*pointW + pointW/2;
+    }
+  }
+
+  function isTopPoint(idx) {
+    return idx >= 12; // indices 12..23 are top row in our rendering
+  }
+
+  function pointTriangle(ctx, cx, top) {
+    const { pointW, pointH } = GEO;
+    const baseY = top ? GEO.pad : (canvas.height - GEO.pad);
+    const tipY  = top ? (GEO.pad + pointH) : (canvas.height - GEO.pad - pointH);
+
+    ctx.beginPath();
+    ctx.moveTo(cx - pointW/2 + 2, baseY);
+    ctx.lineTo(cx + pointW/2 - 2, baseY);
+    ctx.lineTo(cx, tipY);
+    ctx.closePath();
+  }
+
+  function draw() {
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    // board frame
+    ctx.fillStyle = "#12131a";
+    roundRect(ctx, 10, 10, canvas.width-20, canvas.height-20, 18);
+    ctx.fill();
+
+    // inner board
+    ctx.fillStyle = "#2a1a12";
+    roundRect(ctx, GEO.pad, GEO.pad, canvas.width-2*GEO.pad, canvas.height-2*GEO.pad, 14);
+    ctx.fill();
+
+    // bar
+    const barX = GEO.pad + 6*GEO.pointW;
+    ctx.fillStyle = "#0f1115";
+    ctx.fillRect(barX, GEO.pad, GEO.barW, canvas.height-2*GEO.pad);
+
+    // off trays (simple zones on far edges)
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    ctx.fillRect(GEO.pad, GEO.pad, GEO.offW, canvas.height-2*GEO.pad); // left tray (visual)
+    ctx.fillRect(canvas.width-GEO.pad-GEO.offW, GEO.pad, GEO.offW, canvas.height-2*GEO.pad); // right tray
+
+    // triangles
+    for (let i=0;i<24;i++) {
+      const cx = pointX(i);
+      const top = isTopPoint(i);
+      const alt = ((i % 2) === 0);
+      ctx.fillStyle = alt ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.15)";
+      pointTriangle(ctx, cx, top);
+      ctx.fill();
+    }
+
+    // highlight allowed destinations for selectedFrom
+    if (selectedFrom !== null) {
+      const targets = allowedNextMoves.filter(m => m.from === selectedFrom).map(m => m.to);
+      for (const t of targets) {
+        if (t === "off") continue;
+        const cx = pointX(t);
+        const top = isTopPoint(t);
+        ctx.fillStyle = "rgba(80, 200, 255, 0.22)";
+        pointTriangle(ctx, cx, top);
+        ctx.fill();
+      }
+      // highlight off area for bearing off
+      if (targets.includes("off")) {
+        ctx.fillStyle = "rgba(80, 200, 255, 0.18)";
+        const r = offRect(state.turn);
+        roundRect(ctx, r.x, r.y, r.w, r.h, 12);
+        ctx.fill();
+      }
+    }
+
+    // highlight selectable sources
+    if (state.rolled) {
+      const sources = new Set(allowedNextMoves.map(m => m.from));
+      // points
+      for (const s of sources) {
+        if (s === "bar") continue;
+        const cx = pointX(s);
+        const top = isTopPoint(s);
+        ctx.fillStyle = "rgba(120, 255, 160, 0.18)";
+        pointTriangle(ctx, cx, top);
+        ctx.fill();
+      }
+      // bar entry clickable hint
+      if (sources.has("bar")) {
+        ctx.fillStyle = "rgba(120, 255, 160, 0.15)";
+        const r = barRect();
+        roundRect(ctx, r.x, r.y, r.w, r.h, 12);
+        ctx.fill();
+      }
+    }
+
+    // selected source emphasis
+    if (selectedFrom !== null) {
+      ctx.fillStyle = "rgba(255, 220, 120, 0.18)";
+      if (selectedFrom === "bar") {
+        const r = barRect();
+        roundRect(ctx, r.x, r.y, r.w, r.h, 12);
+        ctx.fill();
+      } else {
+        const cx = pointX(selectedFrom);
+        const top = isTopPoint(selectedFrom);
+        pointTriangle(ctx, cx, top);
+        ctx.fill();
+      }
+    }
+
+    // checkers
+    for (let i=0;i<24;i++) drawPointCheckers(i);
+
+    // bar checkers
+    drawBarCheckers();
+
+    // off counts
+    drawOffCounts();
+
+    // labels
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    ctx.font = "bold 16px system-ui, sans-serif";
+    ctx.fillText("BAR", GEO.pad + 6*GEO.pointW + GEO.barW/2 - 18, canvas.height/2 + 6);
+
+    const winner = checkWin();
+    if (winner) {
+      ctx.fillStyle = "rgba(0,0,0,0.5)";
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "800 48px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(`${winner === WHITE ? "White" : "Black"} wins!`, canvas.width/2, canvas.height/2);
+      ctx.font = "600 18px system-ui, sans-serif";
+      ctx.fillText("Refresh to start a new game.", canvas.width/2, canvas.height/2 + 40);
+      ctx.textAlign = "start";
+    }
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    const rr = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+rr, y);
+    ctx.arcTo(x+w, y, x+w, y+h, rr);
+    ctx.arcTo(x+w, y+h, x, y+h, rr);
+    ctx.arcTo(x, y+h, x, y, rr);
+    ctx.arcTo(x, y, x+w, y, rr);
+    ctx.closePath();
+  }
+
+  function checkerColor(owner) {
+    return owner === WHITE ? "#f2f2f2" : "#1e1f24";
+  }
+
+  function checkerStroke(owner) {
+    return owner === WHITE ? "#cfcfcf" : "#3a4150";
+  }
+
+  function drawChecker(cx, cy, owner) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, GEO.checkerR, 0, Math.PI*2);
+    ctx.fillStyle = checkerColor(owner);
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = checkerStroke(owner);
+    ctx.stroke();
+  }
+
+  function drawPointCheckers(idx) {
+    const pt = state.points[idx];
+    if (pt.count <= 0) return;
+
+    const cx = pointX(idx);
+    const top = isTopPoint(idx);
+    const baseY = top ? (GEO.pad + GEO.checkerR + 6) : (canvas.height - GEO.pad - GEO.checkerR - 6);
+    const dir = top ? 1 : -1;
+    const maxShow = 5;
+
+    const show = Math.min(pt.count, maxShow);
+    for (let k=0;k<show;k++) {
+      const cy = baseY + dir*k*(GEO.checkerR*2 - 2);
+      drawChecker(cx, cy, pt.owner);
+    }
+
+    if (pt.count > maxShow) {
+      const cy = baseY + dir*(maxShow-1)*(GEO.checkerR*2 - 2);
+      ctx.fillStyle = pt.owner === WHITE ? "#11141a" : "#e7e7e7";
+      ctx.font = "800 16px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(String(pt.count), cx, cy + 6);
+      ctx.textAlign = "start";
+    }
+  }
+
+  function barRect() {
+    return {
+      x: GEO.pad + 6*GEO.pointW + 10,
+      y: GEO.pad + 10,
+      w: GEO.barW - 20,
+      h: canvas.height - 2*GEO.pad - 20
+    };
+  }
+
+  function drawBarCheckers() {
+    const r = barRect();
+    const cx = r.x + r.w/2;
+
+    // Top half = Black bar stack, bottom half = White bar stack (visual choice)
+    const halfH = r.h/2;
+    const topBaseY = r.y + GEO.checkerR + 4;
+    const bottomBaseY = r.y + r.h - GEO.checkerR - 4;
+
+    const showN = (n) => Math.min(n, 5);
+
+    // Black
+    let nB = state.bar.B;
+    for (let i=0;i<showN(nB);i++) {
+      const cy = topBaseY + i*(GEO.checkerR*2 - 2);
+      drawChecker(cx, cy, BLACK);
+    }
+    if (nB > 5) {
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "800 14px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(String(nB), cx, topBaseY + 4);
+      ctx.textAlign = "start";
+    }
+
+    // White
+    let nW = state.bar.W;
+    for (let i=0;i<showN(nW);i++) {
+      const cy = bottomBaseY - i*(GEO.checkerR*2 - 2);
+      drawChecker(cx, cy, WHITE);
+    }
+    if (nW > 5) {
+      ctx.fillStyle = "#11141a";
+      ctx.font = "800 14px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(String(nW), cx, bottomBaseY + 6);
+      ctx.textAlign = "start";
+    }
+  }
+
+  function offRect(player) {
+    // White bears off on the LEFT tray, Black on the RIGHT tray (visual choice).
+    if (player === WHITE) {
+      return { x: GEO.pad + 6, y: GEO.pad + 6, w: GEO.offW - 12, h: canvas.height - 2*GEO.pad - 12 };
+    } else {
+      return { x: canvas.width - GEO.pad - GEO.offW + 6, y: GEO.pad + 6, w: GEO.offW - 12, h: canvas.height - 2*GEO.pad - 12 };
+    }
+  }
+
+  function drawOffCounts() {
+    const rW = offRect(WHITE);
+    const rB = offRect(BLACK);
+
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    ctx.font = "700 14px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("WHITE OFF", rW.x + rW.w/2, rW.y + 20);
+    ctx.fillText("BLACK OFF", rB.x + rB.w/2, rB.y + 20);
+
+    ctx.font = "900 22px system-ui, sans-serif";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(String(state.off.W), rW.x + rW.w/2, rW.y + 52);
+    ctx.fillText(String(state.off.B), rB.x + rB.w/2, rB.y + 52);
+
+    ctx.textAlign = "start";
+  }
+
+  // ---------- Turn control ----------
+  function startTurn() {
+    selectedFrom = null;
+    chosenMoves = [];
+    history = [];
+    undoBtn.disabled = true;
+    endBtn.disabled = true;
+    state.rolled = false;
+    state.dice = [];
+    allSequences = [];
+    renderDice();
+    updatePills();
+    setStatus(`Click <b>Roll</b> for ${state.turn === WHITE ? "White" : "Black"}.`);
+    draw();
+  }
+
+  function rollDice() {
+    if (checkWin()) return;
+
+    const d1 = randDie();
+    const d2 = randDie();
+    let diceExpanded;
+    if (d1 === d2) diceExpanded = [d1,d1,d1,d1];
+    else diceExpanded = [d1,d2];
+
+    state.dice = diceExpanded;
+    state.rolled = true;
+
+    allSequences = generateLegalSequences(state, state.turn, diceExpanded);
+    chosenMoves = [];
+    history = [];
+    undoBtn.disabled = true;
+
+    if (allSequences.length === 0 || (allSequences.length > 0 && allSequences[0].length === 0)) {
+      allowedNextMoves = [];
+      endBtn.disabled = false;
+      setStatus(`<b>No legal moves</b>. Click <b>End turn</b>.`);
+    } else {
+      allowedNextMoves = computeAllowedNextMoves();
+      endBtn.disabled = true;
+      setStatus(`Make your moves: click a checker (or bar), then a highlighted destination.`);
+    }
+
+    renderDice();
+    updatePills();
+    draw();
+  }
+
+  function endTurn() {
+    if (checkWin()) return;
+    // allow end only if rolled and no further legal continuation from prefix
+    if (!state.rolled) return;
+
+    allowedNextMoves = computeAllowedNextMoves();
+    if (allowedNextMoves.length > 0) {
+      setStatus(`You still have legal moves. Finish them (or use Undo).`);
+      draw();
+      return;
+    }
+
+    // switch turn
+    state.turn = opponent(state.turn);
+    startTurn();
+  }
+
+  function pushHistory() {
+    history.push({
+      state: deepCopy(state),
+      chosenMoves: deepCopy(chosenMoves),
+      sequences: deepCopy(allSequences),
+      selectedFrom
+    });
+  }
+
+  function undo() {
+    if (history.length === 0) return;
+    const h = history.pop();
+    state = h.state;
+    chosenMoves = h.chosenMoves;
+    allSequences = h.sequences;
+    selectedFrom = h.selectedFrom;
+
+    allowedNextMoves = computeAllowedNextMoves();
+    undoBtn.disabled = history.length === 0;
+    endBtn.disabled = !(state.rolled && allowedNextMoves.length === 0);
+
+    renderDice();
+    updatePills();
+    setStatus(`Undid last move. Continue.`);
+    draw();
+  }
+
+  // ---------- Input handling ----------
+  function canvasToLocal(evt) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (evt.clientX - rect.left) * (canvas.width / rect.width);
+    const y = (evt.clientY - rect.top) * (canvas.height / rect.height);
+    return {x,y};
+  }
+
+  function hitTestPoint(x,y) {
+    // Determine which point triangle was clicked, else null.
+    // We'll approximate by column + whether top/bottom.
+    const { pad, pointW, barW } = GEO;
+    const innerX = x - pad;
+    const innerY = y - pad;
+    if (innerX < 0 || innerY < 0 || innerX > canvas.width-2*pad || innerY > canvas.height-2*pad) return null;
+
+    const barStart = 6*pointW;
+    const barEnd = barStart + barW;
+
+    // Bar area:
+    if (innerX >= barStart && innerX <= barEnd) return null;
+
+    const top = innerY < (canvas.height/2);
+    // Determine block: left of bar or right of bar
+    let colInBlock;
+    let inLeftBlock = innerX < barStart;
+    if (!inLeftBlock) {
+      // right block is after bar
+      const rx = innerX - barEnd;
+      if (rx < 0) return null;
+      colInBlock = Math.floor(rx / pointW);
+      if (colInBlock < 0 || colInBlock > 5) return null;
+    } else {
+      colInBlock = Math.floor(innerX / pointW);
+      if (colInBlock < 0 || colInBlock > 5) return null;
+    }
+
+    // Map back to point index
+    if (top) {
+      if (inLeftBlock) {
+        // indices 23..18
+        return 23 - colInBlock;
+      } else {
+        // indices 17..12
+        return 17 - colInBlock;
+      }
+    } else {
+      if (inLeftBlock) {
+        // indices 0..5
+        return colInBlock;
+      } else {
+        // indices 6..11
+        return 6 + colInBlock;
+      }
+    }
+  }
+
+  function hitTestBar(x,y) {
+    const r = barRect();
+    return x >= r.x && x <= r.x+r.w && y >= r.y && y <= r.y+r.h;
+  }
+
+  function hitTestOff(x,y, player) {
+    const r = offRect(player);
+    return x >= r.x && x <= r.x+r.w && y >= r.y && y <= r.y+r.h;
+  }
+
+  function trySelectOrMove(clicked) {
+    if (!state.rolled || checkWin()) return;
+
+    allowedNextMoves = computeAllowedNextMoves();
+
+    // If no moves left, enable end turn
+    endBtn.disabled = !(allowedNextMoves.length === 0);
+    if (allowedNextMoves.length === 0) {
+      setStatus(`No moves left. Click <b>End turn</b>.`);
+      draw();
+      return;
+    }
+
+    // If clicked is a destination while source selected:
+    if (selectedFrom !== null) {
+      const candidates = allowedNextMoves.filter(m => m.from === selectedFrom);
+      let chosen = null;
+
+      for (const m of candidates) {
+        if (m.to === clicked) { chosen = m; break; }
+      }
+
+      if (chosen) {
+        pushHistory();
+        applyMove(state, state.turn, chosen);
+        chosenMoves.push(chosen);
+
+        // filter sequences consistent with prefix
+        filterSequencesByPrefix();
+        selectedFrom = null;
+
+        allowedNextMoves = computeAllowedNextMoves();
+        undoBtn.disabled = history.length === 0;
+        endBtn.disabled = !(allowedNextMoves.length === 0);
+
+        const winner = checkWin();
+        if (winner) {
+          setStatus(`<b>${winner === WHITE ? "White" : "Black"} wins!</b>`);
+        } else if (allowedNextMoves.length === 0) {
+          setStatus(`Move complete. Click <b>End turn</b>.`);
+        } else {
+          setStatus(`Good. Continue your moves.`);
+        }
+
+        renderDice();
+        updatePills();
+        draw();
+        return;
+      }
+    }
+
+    // Otherwise, treat click as selecting a source if it is in allowed sources
+    const sources = new Set(allowedNextMoves.map(m => m.from));
+    if (sources.has(clicked)) {
+      selectedFrom = clicked;
+      setStatus(`Selected source. Now click a highlighted destination.`);
+    } else {
+      selectedFrom = null;
+      setStatus(`Choose a valid checker (highlighted) to move.`);
+    }
+    draw();
+  }
+
+  canvas.addEventListener("click", (evt) => {
+    const {x,y} = canvasToLocal(evt);
+
+    if (!state.rolled) return;
+
+    // bar?
+    if (hitTestBar(x,y)) {
+      trySelectOrMove("bar");
+      return;
+    }
+
+    // off tray destination for current player?
+    if (hitTestOff(x,y, state.turn)) {
+      trySelectOrMove("off");
+      return;
+    }
+
+    const idx = hitTestPoint(x,y);
+    if (idx === null) return;
+
+    // If you clicked a point:
+    // - if selecting: click point as source
+    // - if moving: click point as destination
+    // We pass the raw idx; selection/move logic handles.
+    trySelectOrMove(idx);
+  });
+
+  // Buttons
+  rollBtn.addEventListener("click", () => {
+    if (!state.rolled) rollDice();
+  });
+
+  undoBtn.addEventListener("click", () => undo());
+  endBtn.addEventListener("click", () => endTurn());
+
+  // ---------- Initialize ----------
+  updatePills();
+  renderDice();
+  draw();
+  startTurn();
+})();
+</script>
+</body>
+</html>
